@@ -1,4 +1,6 @@
 *.lnk
 *.bat
+*.sln
 zig-cache/
 zig-out/
+.vs/

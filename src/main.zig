@@ -1,24 +1,60 @@
 const std = @import("std");
+const fib = @import("fibers.zig");
 
-pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+fn foo() noreturn {
+    const teb = std.os.windows.teb();
+    std.debug.print("stackbase {}, stacklimit {}\n", .{teb.*.NtTib.StackBase, teb.*.NtTib.StackLimit});
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
-
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
-
-    try bw.flush(); // don't forget to flush!
+    std.debug.print("hello fibers!\n", .{});
+    std.os.windows.kernel32.ExitProcess(0);
 }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+pub fn main() !void {
+    std.debug.print("\n", .{});
+
+    const len: usize = 4096;
+
+    const MEM_COMMIT: u32 = 0x00001000;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+    // const buf: [len]u8 = undefined;
+    const ptr: *anyopaque = try std.os.windows.VirtualAlloc(null, len, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    var sp: usize = @intFromPtr(ptr) + len;
+    sp = sp & (std.math.maxInt(usize) - 15);
+
+    // const rsp: ?*anyopaque = @ptrFromInt(sp);
+    // std.debug.print("sp {}, rsp {?}\n", .{sp, rsp});
+    // const _sp = sp & (std.math.maxInt(usize) - 15);
+
+    // rsp = @ptrFromInt(_sp);
+    // std.debug.print("sp {}, rsp {?}\n", .{_sp, rsp});
+
+    // sp -= 128;
+
+    std.debug.print("sp {}\n", .{sp});
+    // std.debug.print("sp {}\n", .{sp});
+
+    var c: fib.Context = .{};
+    c.rip = @constCast(@ptrCast(&foo));
+    c.rsp = @ptrFromInt(sp);
+    c.xmm7 = 0x10;
+
+    std.debug.print("c {any}\n", .{c});
+    std.debug.print("&foo() {}\n", .{&foo});
+    std.debug.print("&buf {any}\n", .{ptr});
+
+    // const tmp = std.os.windows.peb();
+    // _ = tmp;
+
+    const teb = std.os.windows.teb();
+    std.debug.print("stackbase {}, stacklimit {}\n",
+        .{teb.*.NtTib.StackBase, teb.*.NtTib.StackLimit});
+    std.debug.print("stackbase {}, stacklimit {}\n",
+        .{@intFromPtr(teb.*.NtTib.StackBase), @intFromPtr(teb.*.NtTib.StackLimit)});
+
+    fib.setContext(&c);
+
+    // var ctx: std.os.windows.CONTEXT = undefined;
+    // std.os.windows.ntdll.RtlCaptureContext(&ctx);
+    // std.debug.print("context {}\n", .{ctx});
 }
