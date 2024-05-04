@@ -9,33 +9,18 @@
 // https://joeduffyblog.com/2006/06/17/tebs-and-stacks/
 // https://en.wikipedia.org/wiki/Win32_Thread_Information_Block
 // https://stackoverflow.com/questions/30725276/modifying-the-stack-on-windows-tib-and-exceptions
+// https://stackoverflow.com/questions/71259613/c-fibers-crashing-on-printf
+// https://github.com/boostorg/context
 
 // TODO:
 // - find out if you need to return from context switch
+// - how to deal with noreturn functions
 // - coroutine api and dataflow
 // - scheduling implementation
 // - multithreading (win32 threads or concurrency kit for primitives)
 // - compile time checks for platforms and cpus
 
 const std = @import("std");
-
-const CONTEXT = std.os.windows.CONTEXT;
-const WINAPI = std.os.windows.WINAPI;
-
-pub extern "ntdll" fn RtlCaptureContext(ctx: *CONTEXT) callconv(WINAPI) void;
-pub extern "ntdll" fn RtlRestoreContext(ctx: *CONTEXT, exception: ?*anyopaque) callconv(WINAPI) void;
-
-fn ptrAdd(ptr: *anyopaque, a: usize) *anyopaque {
-    var tmp: usize = @intFromPtr(ptr);
-    tmp += a;
-    return @ptrFromInt(tmp);
-}
-
-fn ptrSub(ptr: *anyopaque, a: usize) *anyopaque {
-    var tmp: usize = @intFromPtr(ptr);
-    tmp -= a;
-    return @ptrFromInt(tmp);
-}
 
 pub const Context = packed struct {
     rip: ?*anyopaque = null,
@@ -60,27 +45,48 @@ pub const Context = packed struct {
     xmm13: i128 = 0,
     xmm14: i128 = 0,
     xmm15: i128 = 0,
+
+    // NT_TIB stuff
+    fiber_storage: usize = 0,
+    deallocation_stack: usize = 0,
+    stack_limit: usize = 0,
+    stack_base: usize = 0,
 };
 
-pub fn setContext(c: *Context) noreturn {
-    var ctx: CONTEXT = undefined;
-    RtlCaptureContext(&ctx);
+comptime {
+    std.debug.assert(@offsetOf(Context, "fiber_storage") == 8*30);
+    std.debug.assert(@offsetOf(Context, "deallocation_stack") == 8*31);
+    std.debug.assert(@offsetOf(Context, "stack_limit") == 8*32);
+    std.debug.assert(@offsetOf(Context, "stack_base") == 8*33);
+}
 
-    ctx.Rip = @intFromPtr(c.*.rip);
-    ctx.Rsp = @intFromPtr(ptrSub(c.*.rsp.?, 8));
-    
-    // TODO: test out if this is super necessary
-    const teb = std.os.windows.teb();
-    teb.*.NtTib.StackBase = ptrSub(c.*.rsp.?, 8);
-    teb.*.NtTib.StackLimit = ptrSub(c.*.rsp.?, 4096);
-    
-    RtlRestoreContext(&ctx, null);
-     
+pub fn setContext(c: *Context) noreturn {
     asm volatile (
-        // save return address
-        \\ movq 8*0(%[ptr]), %r8
+        // load new addresses into NT_TIB
+        \\ movq  %gs:(0x30), %r10
             
-        // load new satck pot
+        // restore fiber local storage
+        \\ movq  8*30(%[ptr]), %rax
+        \\ movq  %rax, 0x20(%r10)
+            
+        // restore current deallocation stack
+        \\ movq  8*31(%[ptr]), %rax
+        \\ movq  %rax, 0x1478(%r10)
+            
+        // restore current stack limit
+        \\ movq  8*32(%[ptr]), %rax
+        \\ movq  %rax, 0x10(%r10)
+            
+        // restore current stack base
+        \\ movq  8*33(%[ptr]), %rax
+        \\ movq  %rax, 0x08(%r10)
+
+        // OLD STUFF
+                    
+        // save return address
+        \\ movq 8*0(%[ptr]), %r9
+            
+        // load new stack pointer
         \\ movq 8*1(%[ptr]), %rsp
             
         // load preserved registers
@@ -103,14 +109,15 @@ pub fn setContext(c: *Context) noreturn {
         \\ movups 8*10+16*8(%[ptr]), %xmm14
         \\ movups 8*10+16*9(%[ptr]), %xmm15
 
-        // push rip to stack for return
-        \\ pushq %r8
-        \\ xor %eax, %eax
-        \\ retq
+        // since jump is going to push rbp,
+        // make sure rsp is 16 byte aligned
+        \\ leaq -8*1(%rsp), %rsp
+        // jump to new rip
+        \\ jmpq *%r9
+        // other possibility is to use retq or callq
             :
             :[ptr] "rdx" (c)
     );
 
     @trap();
 }
-
