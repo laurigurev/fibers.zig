@@ -1,10 +1,11 @@
 const std = @import("std");
 const fib = @import("fibers.zig");
 
-fn foo() noreturn {
-    print_nt_tib();
+fn foo() void {
+    // print_nt_tib();
     std.debug.print("hello fibers!\n", .{});
-    std.os.windows.kernel32.ExitProcess(0);
+
+    // std.os.windows.kernel32.ExitProcess(0);
 }
 
 pub fn main() !void {
@@ -25,7 +26,7 @@ pub fn main() !void {
     var c: fib.Context = .{};
     c.rip = @constCast(@ptrCast(&foo));
     c.rsp = @ptrFromInt(sp);
-    c.rbp = @ptrFromInt(sp);
+    // c.rbp = @ptrFromInt(sp);
     c.fiber_storage = 0;
     c.deallocation_stack = @intFromPtr(ptr);
     c.stack_limit = @intFromPtr(ptr);
@@ -36,6 +37,8 @@ pub fn main() !void {
     print_nt_tib();
     
     fib.setContext(&c);
+
+    std.debug.print("hello main!\n", .{});
 }
 
 inline fn print_nt_tib() void {
