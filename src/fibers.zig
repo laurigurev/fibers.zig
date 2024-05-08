@@ -38,7 +38,6 @@
 // - checks for stack and memory alignment
 // - measure cycles
 // - add support for custom data
-// - allocator
 // - wait list control integer
 
 fn RingBuffer(comptime T: type, comptime len: usize) type {
@@ -98,10 +97,93 @@ fn RingBuffer(comptime T: type, comptime len: usize) type {
 	};
 }
 
+const Allocator = struct {
+	const Self = @This();
+	
+	status: u64 = 0,
+	mem: usize = 0,
+
+	fn alloc(self: *Self) usize {
+		const one: usize = 1;
+		for (0..64) |i| {
+			const a: usize = @shlExact(one, @intCast(i));
+			
+			if ((self.status & a) == 0) {
+				self.status |= a;
+				return self.mem + i * STACK_SIZE;
+			}
+		}
+		return 0;
+	}
+
+	fn free(self: *Self, mem: usize) void {
+		const one: usize = 1;
+		
+		const a: usize = mem - self.mem;
+		const b: usize = a / STACK_SIZE;
+		const c: usize = @shlExact(one, @intCast(b));
+		self.status &= ~c;
+	}
+};
+
+const WaitList = struct {
+	const Self = @This();
+	
+	keys: [WAIT_LIST_SIZE]u64 = [_]u64{ 0 } ** WAIT_LIST_SIZE,
+	vals: [WAIT_LIST_SIZE]u32 = undefined,
+	ctxs: [WAIT_LIST_SIZE]Context = undefined,
+	
+	fn get(self: *Self) usize {
+		for (self.keys, 0..) |k, i| {
+			if (k == 0) {
+				return i;
+			}
+		}
+		return WAIT_LIST_SIZE;
+	}
+
+	fn chk(self: *Self) usize {
+		var num: usize = 0;
+		for (self.keys, self.vals) |k, v| {
+			if (k != 0 and v == 0) {
+				num += 1;
+			}
+		}
+		return num;
+	}
+
+	fn verify(self: *Self, key: u64) void {
+		if (key == 0) {
+			return;
+		}
+		
+		var num: usize = 0;
+		for (self.keys) |k| {
+			if (k == key) {
+				num += 1;
+			}
+		}
+
+		if (num > 1) {
+			@panic("duplicate keys in wait list!");
+		}
+	}
+
+	fn pop(self: *Self) usize {
+		for (self.keys, self.vals, 0..) |k, v, i| {
+			if (k != 0 and v == 0) {
+				self.keys[i] = 0;
+				self.vals[i] = 0;
+				return i;
+			}
+		}
+		return WAIT_LIST_SIZE;
+	}
+};
+
 pub const Info = struct {
+	name: []const u8,
 	func: usize,
-	mem: usize,
-	size: usize,
 };
 
 pub const Context = packed struct {
@@ -135,18 +217,74 @@ pub const Context = packed struct {
     stack_base: u64 = 0,
 };
 
+const STACK_SIZE: usize = 16*1024;
+const WAIT_LIST_SIZE: usize = 16;
+
+var allocator: Allocator = .{};
 var fibers: RingBuffer(Info, 128) = .{};
-var wait_list: RingBuffer(Context, 16) = .{};
+var wait_list: WaitList = .{};
+
+fn fnv1(str: []const u8) u64 {
+	// https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
+	const FNV_offset_basis: u64 = 0xcbf29ce484222325;
+	const FNV_prime: u64 = 0x100000001b3;
+
+	var hash = FNV_offset_basis;
+	for (str) |b| {
+		hash = hash *| FNV_prime;
+		hash = hash ^ b;
+	}
+	
+	if (hash == 0) {
+		hash = 1;
+	}
+	return hash;
+}
+
+pub fn sizeof() usize {
+	return 64*STACK_SIZE;
+}
+
+pub fn init(mem: usize) void {
+	allocator.status = 0;
+	allocator.mem = mem;
+}
+
+// TODO: remove
+const std = @import("std");
+
+pub fn get_value(name: []const u8) u32 {
+	const key = fnv1(name);
+	// std.debug.print("get_value(), key {}\n", .{key});
+	
+	for (wait_list.keys, wait_list.vals) |k, v| {
+		if (key == k) {
+			// std.debug.print("get_value(), key {}, value {}\n", .{k, v});
+			return v;
+		}
+	}
+	return 0;
+}
+
+pub fn set_value(name: []const u8, value: u32) void {
+	const key = fnv1(name);
+	for (wait_list.keys, 0..) |k, i| {
+		if (key == k) {
+			wait_list.vals[i] = value;
+			return;
+		}
+	}
+}
 
 pub fn poll() bool {
-	if (fibers.num != 0 or wait_list.num != 0) {
+	if (fibers.num != 0 or wait_list.chk() != 0) {
 		return true;
 	}
 	return false;
 }
 
 pub fn run() void {
-	if (wait_list.num != 0) {
+	if (wait_list.chk() != 0) {
 		cont();
 	}
 	else {
@@ -155,21 +293,34 @@ pub fn run() void {
 }
 
 pub fn push(info: Info) void {
-	// TODO: check size is more than 2xcontext size
 	fibers.push(info);
 }
 
 fn pop() void {
 	const info: Info = fibers.pop();
-	
-	var new: Context = .{};
-	new.rip = info.func;
-	new.rsp = info.mem + info.size - @sizeOf(Context);
-    new.fiber_storage = 0;
-    new.deallocation_stack = info.mem;
-    new.stack_limit = info.mem;
-    new.stack_base = info.mem + info.size;
 
+	const mem = allocator.alloc();
+	const size = STACK_SIZE;
+	
+	var ctx: Context = .{};
+	ctx.rip = info.func;
+	ctx.rsp = mem + size - @sizeOf(Context);
+    ctx.fiber_storage = 0;
+    ctx.deallocation_stack = mem;
+    ctx.stack_limit = mem;
+    ctx.stack_base = mem + size;
+
+	// std.debug.print("pop(), key {}\n", .{fnv1(info.name)});
+	
+	// since we use items on the stack and don't
+	// control where they are pushed, we use this
+	// proxy for assembly only functions
+	__pop(&ctx);
+
+	allocator.free(mem);
+}
+
+fn __pop(ctx: *Context) void {
 	// saving current context at the bottom of the stack
 	asm volatile (
 			// instruction pointer is not needed because we
@@ -210,7 +361,7 @@ fn pop() void {
         	\\ movq 0x08(%r10), %rax
         	\\ movq %rax, 8*33(%[stack])
 			:
-			:[stack] "{rcx}" (new.rsp)
+			:[stack] "{rcx}" (ctx.*.rsp)
 	);
 
 	asm volatile (
@@ -251,7 +402,7 @@ fn pop() void {
 			
         	\\ callq *%rdx
 			:
-			:[dst] "{rcx}" (&new)
+			:[dst] "{rcx}" (ctx)
 	);
 
 	asm volatile (
@@ -259,6 +410,7 @@ fn pop() void {
 			// at the bottom of the stack
         	\\ movq %gs:(0x30), %r10
         	\\ movq 0x08(%r10), %rax
+			// remember that we have context + pad + key
 			\\ leaq -8*34(%rax), %rcx
 
 			// getting instruction pointer is not 
@@ -301,10 +453,26 @@ fn pop() void {
 	);
 }
 
-pub fn pause() void {
-	wait_list.push(.{});
-	const ctx = wait_list.last();
+pub fn pause(value: u32) void {
+	const idx = wait_list.get();
+
+	wait_list.keys[idx] = 1;
+	wait_list.vals[idx] = value;
+
+	// since we use items on the stack and don't
+	// control where they are pushed, we use this
+	// proxy for assembly only functions
+	__pause0(&wait_list.ctxs[idx]);
 	
+	// std.debug.print("pause(...), idx {}, key {}, val {}\n", .{
+	// 	idx, wait_list.keys[idx], wait_list.vals[idx]
+	// });
+	// wait_list.verify(wait_list.keys[idx]);
+	
+	__pause1(&wait_list.ctxs[idx]);
+}
+
+fn __pause0(ctx: *Context) void {
 	// creating new context to return to
 	asm volatile (
 			// saving label as return point since
@@ -343,8 +511,18 @@ pub fn pause() void {
         	\\ movq %rax, 8*32(%[ctx])
         	\\ movq 0x08(%r10), %rax
         	\\ movq %rax, 8*33(%[ctx])
+			:
+			:[ctx] "{rcx}" (ctx)
+	);
+}
 
-			// return address can be found in the stack
+fn __pause1(ctx: *Context) void {
+	// creating new context to return to
+	asm volatile (
+        	\\ movq %gs:(0x30), %r10
+        	\\ movq 0x08(%r10), %rax
+
+			// remember that we have context + pad + key
 			\\ leaq -8*34(%rax), %rdx
 			\\ leaq -8*1(%rdx), %rsp
 			\\ retq
@@ -355,11 +533,18 @@ pub fn pause() void {
 	);
 }
 
-const std = @import("std");
-
 fn cont() void {
-	const ctx: *Context = wait_list.pop_silent();
+	const idx = wait_list.pop();
 	
+	// since we use items on the stack and don't
+	// control where they are pushed, we use this
+	// proxy for assembly only functions
+	__cont(&wait_list.ctxs[idx]);
+	
+	allocator.free(wait_list.ctxs[idx].stack_limit);
+}
+
+fn __cont(ctx: *Context) void {
 	// saving current context and overriding old context
 	asm volatile (
 			// No need to save instruction pointer since we
@@ -406,7 +591,7 @@ fn cont() void {
         	\\ leaq CONTINUE1(%rip), %rdx
 			\\ movq %rdx, (%rax)
 			:
-			:[stack] "{rcx}" (ctx.stack_base - @sizeOf(Context))
+			:[stack] "{rcx}" (ctx.*.stack_base - @sizeOf(Context))
 	);
 
 	// restoring context from the wait list
@@ -446,7 +631,7 @@ fn cont() void {
         	\\ movq 8*33(%[ctx]), %rax
         	\\ movq %rax, 0x08(%r10)
 			
-			// DONT'T use RETQ since we don't want to disturb
+			// DONT'T use CALLQ since we don't want to disturb
 			// the current %RSP and we have replaced return 
 			// address in previous asm block
         	\\ jmpq *%rdx
@@ -462,6 +647,7 @@ fn cont() void {
 			// retrieving context from the stack
         	\\ movq %gs:(0x30), %r10
         	\\ movq 0x08(%r10), %rax
+			// remember that we have context + pad + key
 			\\ leaq -8*34(%rax), %rcx
 			
 			// no need to replace instruction pointer
