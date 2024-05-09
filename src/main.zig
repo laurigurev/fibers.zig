@@ -3,7 +3,7 @@ const fib = @import("fibers.zig");
 
 fn foo() void {
     std.debug.print("hello fibers from foo at step 0!\n", .{});
-    fib.pause(0);
+    fib.pause(1);
     std.debug.print("hello fibers from foo at step 1!\n", .{});
     fib.pause(0);
     std.debug.print("hello fibers from foo at step 2!\n", .{});
@@ -13,8 +13,8 @@ fn foo() void {
 
 fn bar() void {
     std.debug.print("hello fibers from bar!\n", .{});
-    // const foo_val = fib.get_value("foo");
-    // fib.set_value("foo", foo_val - 1);
+    const foo_val = fib.get_value("foo");
+    fib.set_value("foo", foo_val - 1);
 }
 
 pub fn main() !void {
