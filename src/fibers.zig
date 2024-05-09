@@ -9,8 +9,10 @@
 //   | - - - - - - - - |
 //   | - - - - - - - - |
 //   | - - - - - - - - |
-//   | - return addr - |
+//   | - return addr - | <- rsp
 //   | - - old ctx - - |
+//   | -  user data  - |
+//   | - - header  - - |
 //   |-----------------| <- high addr
 //   
 
@@ -37,8 +39,8 @@
 // - compile time checks for platforms and cpus
 // - checks for stack and memory alignment
 // - measure cycles
-// - add support for custom data
 // - comment everything
+// - better names for WaitList functions
 
 fn RingBuffer(comptime T: type, comptime len: usize) type {
 	return struct {
@@ -193,7 +195,8 @@ const WaitList = struct {
 
 pub const Info = struct {
 	name: []const u8,
-	func: usize,
+	func: u64,
+	user_data: u256,
 };
 
 const Context = packed struct {
@@ -338,6 +341,18 @@ fn pop() void {
     ctx.stack_limit = mem;
     ctx.stack_base = mem + size;
 
+	{
+		// TODO: find better way to do this
+		var dst: []u8 = undefined;
+		dst.ptr = @ptrFromInt(header.p_user_data);
+		dst.len = 32;
+		
+		var src: []u8 = undefined;
+		src.ptr = @constCast(@ptrCast(&info.user_data));
+		src.len = 32;
+
+		@memcpy(dst, src);
+	}
 	// std.debug.print("pop(), key {}\n", .{fnv1(info.name)});
 	
 	// since we use items on the stack and don't
@@ -758,6 +773,37 @@ fn __cont(ctx: *Context) void {
         	\\ movq  8*33(%rdx), %rax
         	\\ movq  %rax, 0x08(%r10)
 			:
+			:
+	);
+}
+
+pub fn pack(user_data: anytype) u256 {
+	staticAssert(@sizeOf(@TypeOf(user_data)) <= 32);
+	
+	var payload: u256 = 0;
+	
+	var dst: []u8 = undefined;
+	dst.ptr = @ptrCast(&payload);
+	dst.len = @sizeOf(@TypeOf(user_data));
+	
+	var src: []u8 = undefined;
+	src.ptr = @constCast(@ptrCast(&user_data));
+	src.len = @sizeOf(@TypeOf(user_data));
+	
+	@memcpy(dst, src);
+	
+	return payload;
+}
+
+pub fn getUserData(comptime T: type) *T {
+	return asm volatile (
+			// retrieve header
+        	\\ movq %gs:(0x30), %r10
+        	\\ movq 0x08(%r10), %rax
+        	\\ leaq -8*4(%rax), %rax
+			// return Header::p_user_data
+			\\ movq 8*1(%rax), %rax
+			: [ret] "={rax}" (-> *T)
 			:
 	);
 }

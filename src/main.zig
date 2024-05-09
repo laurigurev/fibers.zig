@@ -2,7 +2,8 @@ const std = @import("std");
 const fib = @import("fibers.zig");
 
 fn foo() void {
-    std.debug.print("hello fibers from foo at step 0!\n", .{});
+    const user_data = fib.getUserData(Foo);
+    std.debug.print("hello fibers from foo at step 0 with user data of {}!\n", .{user_data.*});
     fib.pause(1);
     std.debug.print("hello fibers from foo at step 1!\n", .{});
     fib.pause(0);
@@ -11,11 +12,25 @@ fn foo() void {
     std.debug.print("hello fibers from foo at step 3!\n", .{});
 }
 
+const Foo = struct {
+    a: u64 = 0,
+    b: u64 = 1,
+    c: u64 = 2,
+    d: u64 = 3,
+};
+
 fn bar() void {
-    std.debug.print("hello fibers from bar!\n", .{});
+    const user_data = fib.getUserData(Bar);
+    std.debug.print("hello fibers from bar with user data of {}!\n", .{user_data.*});
     const foo_val = fib.get_value("foo");
     fib.set_value("foo", foo_val - 1);
 }
+
+const Bar = struct {
+    a: u64 = 4,
+    b: u64 = 5,
+    c: u64 = 6,
+};
 
 pub fn main() !void {
     std.debug.print("begin main!\n", .{});
@@ -32,8 +47,11 @@ pub fn main() !void {
 
     fib.init(mem);
 
-    fib.push(.{ .name = "foo", .func = p_foo});
-    fib.push(.{ .name = "bar", .func = p_bar});
+    const foo_user_data = fib.pack(Foo{});
+    const bar_user_data = fib.pack(Bar{});
+
+    fib.push(.{ .name = "foo", .func = p_foo, .user_data = foo_user_data});
+    fib.push(.{ .name = "bar", .func = p_bar, .user_data = bar_user_data});
 
     while (fib.poll()) {
         fib.run();
