@@ -32,6 +32,13 @@
 // https://medium.com/@sruthk/cracking-assembly-introduction-to-assembly-language-a4ad14e601a1
 // https://sonictk.github.io/asm_tutorial/#beatingthecompiler
 // https://stackoverflow.com/questions/57212012/how-to-load-address-of-function-or-label-into-register
+// https://dev.to/kprotty/understanding-atomics-and-memory-ordering-2mom
+// https://learn.microsoft.com/en-us/windows/win32/Sync/slim-reader-writer--srw--locks
+// https://gist.github.com/cabarger/d3879745b8477670070f826cad2f027d?permalink_comment_id=4816454
+// https://web.archive.org/web/20221127015901/http://concurrencykit.org/doc/ck_spinlock.html
+// https://en.cppreference.com/w/cpp/atomic/memory_order
+// https://llvm.org/docs/Atomics.html
+// https://stackoverflow.com/questions/12346487/what-do-each-memory-order-mean
 
 // TODO:
 // - scheduling implementation
@@ -271,7 +278,7 @@ pub fn init(mem: usize) void {
 }
 
 // TODO: remove
-const std = @import("std");
+// const std = @import("std");
 
 pub fn get_value(name: []const u8) u32 {
 	const key = fnv1(name);
