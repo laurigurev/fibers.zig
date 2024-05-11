@@ -39,6 +39,17 @@
 // https://en.cppreference.com/w/cpp/atomic/memory_order
 // https://llvm.org/docs/Atomics.html
 // https://stackoverflow.com/questions/12346487/what-do-each-memory-order-mean
+// https://www.youtube.com/watch?v=AN6XHy2znzc&list=PLxNPSjHT5qvsZyes3ATYvhPhwkoY33L2v
+// https://geidav.wordpress.com/2016/03/12/important-properties-of-spinlocks/
+// https://geidav.wordpress.com/tag/exponential-back-off/
+// https://en.wikipedia.org/wiki/Exponential_backoff
+// https://github.com/CoffeeBeforeArch/spinlocks/tree/main
+// https://www.cs.utexas.edu/~bornholt/post/memory-models.html
+// https://stackoverflow.com/questions/32705169/does-the-intel-memory-model-make-sfence-and-lfence-redundant
+// https://preshing.com/20120515/memory-reordering-caught-in-the-act/
+// https://preshing.com/20120625/memory-ordering-at-compile-time/
+// https://en.wikipedia.org/wiki/Memory_ordering
+// https://peeterjoot.wordpress.com/2009/12/04/intel-memory-ordering-fence-instructions-and-atomic-operations/
 
 // TODO:
 // - scheduling implementation
