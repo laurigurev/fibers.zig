@@ -52,24 +52,57 @@
 // https://peeterjoot.wordpress.com/2009/12/04/intel-memory-ordering-fence-instructions-and-atomic-operations/
 
 // TODO:
-// - scheduling implementation
-// - multithreading (win32 threads or concurrency kit for primitives)
 // - compile time checks for platforms and cpus
 // - checks for stack and memory alignment
 // - measure cycles
 // - comment everything
-// - better names for WaitList functions
+
+const std = @import("std");
+const builtin = @import("builtin");
+const native_arch = builtin.cpu.arch;
+
+const Spinlock = struct {
+    const Self = @This();
+    
+    value: u32 = undefined,
+
+    fn init(self: *Self) void {
+        self.value = 0;
+    }
+    fn lock(self: *Self) void {
+        const EXPONENTIAL_BACKOFF_MIN: u32 = 4;
+        const EXPONENTIAL_BACKOFF_MAX: u32 = 1024;
+        
+        var backoff: u32 = EXPONENTIAL_BACKOFF_MIN;
+        while (@cmpxchgWeak(u32, &self.value, 0, 1, .seq_cst, .seq_cst) != null) {
+            for (0..backoff) |_| {
+            }
+            backoff = @min(backoff << 1, EXPONENTIAL_BACKOFF_MAX);
+        }
+    }
+    fn unlock(self: *Self) void {
+        self.value = 0;
+    }
+};
 
 fn RingBuffer(comptime T: type, comptime len: usize) type {
 	return struct {
 		const Self = @This();
 		
+		spinlock: Spinlock = .{},
 		start: usize = 0,
 		end: usize = 0,
 		num: usize = 0,
 		data: [len]T = undefined,
 
+		fn init(self: *Self) void {
+			self.spinlock.init();
+		}
+
 		fn push(self: *Self, t: T) void {
+			self.spinlock.lock();
+			defer self.spinlock.unlock();
+			
 			if (self.num == len) {
 				@panic("RingArray does not have anywhere to push!");
 			}
@@ -83,8 +116,11 @@ fn RingBuffer(comptime T: type, comptime len: usize) type {
 		}
 
 		fn pop(self: *Self) T {
+			self.spinlock.lock();
+			defer self.spinlock.unlock();
+			
 			if (self.num == 0) {
-				@panic("RingArray does not have anything to pop!");
+				return .{ .name = undefined, .func = 0, .user_data = 0 };
 			}
 			const tmp = self.data[self.start];
 			self.num -= 1;
@@ -94,36 +130,24 @@ fn RingBuffer(comptime T: type, comptime len: usize) type {
 			}
 			return tmp;
 		}
-		
-		fn pop_silent(self: *Self) *T {
-			if (self.num == 0) {
-				@panic("RingArray does not have anything to pop!");
-			}
-			const tmp = &self.data[self.start];
-			self.num -= 1;
-			self.start += 1;
-			if (self.start == len) {
-				self.start = 0;
-			}
-			return tmp;
-		}
-
-		fn last(self: *Self) *T {
-			if (self.num == 0) {
-				@panic("RingArray is empty!");
-			}
-			return &self.data[self.end - 1];
-		}
 	};
 }
 
 const Allocator = struct {
 	const Self = @This();
 	
+	spinlock: Spinlock = .{},
 	status: u64 = 0,
 	mem: usize = 0,
 
+	fn init(self: *Self) void {
+		self.spinlock.init();
+	}
+	
 	fn alloc(self: *Self) usize {
+		self.spinlock.lock();
+		defer self.spinlock.unlock();
+		
 		const one: usize = 1;
 		for (0..64) |i| {
 			const a: u64 = @shlExact(one, @intCast(i));
@@ -137,6 +161,9 @@ const Allocator = struct {
 	}
 
 	fn free(self: *Self, mem: usize) void {
+		self.spinlock.lock();
+		defer self.spinlock.unlock();
+		
 		const one: usize = 1;
 		
 		const a: usize = mem - self.mem;
@@ -149,72 +176,84 @@ const Allocator = struct {
 const WaitList = struct {
 	const Self = @This();
 	
+	spinlock: Spinlock = .{},
 	keys: [WAIT_LIST_SIZE]u64 = [_]u64{ 0 } ** WAIT_LIST_SIZE,
+	thread_ids: [WAIT_LIST_SIZE]u64 = [_]u64{ 0 } ** WAIT_LIST_SIZE,
 	vals: [WAIT_LIST_SIZE]u32 = undefined,
 	ctxs: [WAIT_LIST_SIZE]Context = undefined,
 	
-	fn get(self: *Self) usize {
+	fn init(self: *Self) void {
+		self.spinlock.init();
+	}
+	
+	// does not use spinlock!
+	fn reserve_unsafe(self: *Self, key: u64) usize {
 		for (self.keys, 0..) |k, i| {
 			if (k == 0) {
+				self.keys[i] = key;
+				self.thread_ids[i] = 0;
+				self.vals[i] = 0;
 				return i;
 			}
 		}
 		return WAIT_LIST_SIZE;
 	}
 
-	fn chk(self: *Self) usize {
-		var num: usize = 0;
-		for (self.keys, self.vals) |k, v| {
-			if (k != 0 and v == 0) {
-				num += 1;
-			}
-		}
-		return num;
-	}
-
-	fn verify(self: *Self, key: u64) void {
-		if (key == 0) {
-			return;
-		}
+	// searches for context with mathching key irrespective of other values
+	fn search(self: *Self, key: u64) usize {
+		self.spinlock.lock();
+		defer self.spinlock.unlock();
 		
-		var num: usize = 0;
-		for (self.keys) |k| {
-			if (k == key) {
-				num += 1;
-			}
-		}
-
-		if (num > 1) {
-			@panic("duplicate keys in wait list!");
-		}
-	}
-
-	fn pop(self: *Self) usize {
-		for (self.keys, self.vals, 0..) |k, v, i| {
-			if (k != 0 and v == 0) {
-				// self.keys[i] = 0;
-				// self.vals[i] = 0;
-				return i;
-			}
-		}
-		return WAIT_LIST_SIZE;
-	}
-
-	fn find(self: *Self, key: u64, idx: *usize) bool {
 		for (self.keys, 0..) |k, i| {
 			if (key == k) {
-				idx.* = i;
-				return true;
+				return i;
 			}
+		}
+		return WAIT_LIST_SIZE;
+	}
+	
+	// searches for valid context with zero value using thread id
+	fn find_with_thread(self: *Self, thread_id: u64) usize {
+		self.spinlock.lock();
+		defer self.spinlock.unlock();
+		
+		for (self.keys, self.thread_ids, self.vals, 0..) |k, t, v, i| {
+			if (k != 0 and t == thread_id and v == 0) {
+				return i;
+			}
+		}
+		return WAIT_LIST_SIZE;
+	}
+
+	// removes context if value is zero
+	fn remove_at_zero(self: *Self, idx: usize) bool {
+		self.spinlock.lock();
+		defer self.spinlock.unlock();
+		
+		assert(self.keys[idx] != 0);
+		if (self.vals[idx] == 0) {
+			self.keys[idx] = 0;
+			self.thread_ids[idx] = 0;
+			self.vals[idx] = 0;
+			return true;
 		}
 		return false;
 	}
 };
 
 pub const Info = struct {
+	const Self = @This();
+	
 	name: []const u8,
 	func: u64,
 	user_data: u256,
+
+	fn is_valid(self: *const Self) bool {
+		if (self.func == 0) {
+			return false;
+		}
+		return true;
+	}
 };
 
 const Context = packed struct {
@@ -252,11 +291,14 @@ const Header = packed struct {
 	key: u64 = 0,
 	p_user_data: u64 = 0,
 	p_context: u64 = 0,
-	padding: u64 = 0,
+	thread_id: u64 = 0,
 };
 
 const STACK_SIZE: usize = 16*1024;
 const WAIT_LIST_SIZE: usize = 16;
+const MAX_CORES: usize = 2;
+
+var b_exit: bool = false;
 
 var allocator: Allocator = .{};
 var fibers: RingBuffer(Info, 128) = .{};
@@ -286,104 +328,121 @@ pub fn sizeof() usize {
 pub fn init(mem: usize) void {
 	allocator.status = 0;
 	allocator.mem = mem;
-}
-
-// TODO: remove
-// const std = @import("std");
-
-pub fn get_value(name: []const u8) u32 {
-	const key = fnv1(name);
-	// std.debug.print("get_value(), key {}\n", .{key});
 	
-	for (wait_list.keys, wait_list.vals) |k, v| {
-		if (key == k) {
-			// std.debug.print("get_value(), key {}, value {}\n", .{k, v});
-			return v;
-		}
-	}
-	return 0;
+	allocator.init();
+	fibers.init();
+	wait_list.init();
 }
 
-pub fn set_value(name: []const u8, value: u32) void {
+pub fn exit() void {
+	b_exit = true;
+}
+
+pub fn dec(name: []const u8) bool {
 	const key = fnv1(name);
+
+	wait_list.spinlock.lock();
+	defer wait_list.spinlock.unlock();
+
 	for (wait_list.keys, 0..) |k, i| {
 		if (key == k) {
-			wait_list.vals[i] = value;
-			return;
+			if (wait_list.vals[i] > 0) {
+				wait_list.vals[i] -= 1;
+				return true;
+			}
 		}
 	}
-}
-
-pub fn poll() bool {
-	if (fibers.num != 0 or wait_list.chk() != 0) {
-		return true;
-	}
 	return false;
-}
-
-pub fn run() void {
-	if (wait_list.chk() != 0) {
-		cont();
-	}
-	else {
-		pop();
-	}
 }
 
 pub fn push(info: Info) void {
 	fibers.push(info);
 }
 
-fn pop() void {
-	const info: Info = fibers.pop();
-
-	const mem = allocator.alloc();
-	const size = STACK_SIZE;
-
-	// std.debug.print("pop(), mem {}\n", .{mem});
-
-	var rsp: usize = mem + size - @sizeOf(Header);
-
-	var header: Header = .{};
-	header.key = fnv1(info.name);
-	rsp -= 32;
-	header.p_user_data = rsp;
-	rsp -= @sizeOf(Context);
-	header.p_context = rsp;
-
-	var ctx: Context = .{};
-	ctx.rip = info.func;
-	ctx.rsp = rsp;
-    ctx.fiber_storage = 0;
-    ctx.deallocation_stack = mem;
-    ctx.stack_limit = mem;
-    ctx.stack_base = mem + size;
-
-	{
-		// TODO: find better way to do this
-		var dst: []u8 = undefined;
-		dst.ptr = @ptrFromInt(header.p_user_data);
-		dst.len = 32;
-		
-		var src: []u8 = undefined;
-		src.ptr = @constCast(@ptrCast(&info.user_data));
-		src.len = 32;
-
-		@memcpy(dst, src);
-	}
-	// std.debug.print("pop(), key {}\n", .{fnv1(info.name)});
+pub fn start() void {
+	var threads: [MAX_CORES - 1]HANDLE = undefined;
 	
-	// since we use items on the stack and don't
-	// control where they are pushed, we use this
-	// proxy for assembly only functions
-	__pop(&header, &ctx);
-
-	var idx: usize = 0;
-	if (!wait_list.find(header.key, &idx)) {
-		allocator.free(mem);
+	var system_info: SYSTEM_INFO = undefined;
+	GetSystemInfo(&system_info);
+	var num_cores: u32 = system_info.dwNumberOfProcessors;
+	num_cores = @min(MAX_CORES - 1, num_cores);
+	
+	for (0..num_cores) |i| {
+        threads[i] = CreateThread(null, 0, &thread_entry, null, 0, null);
 	}
-	else {
-		assert(wait_list.vals[idx] != 0);
+	
+	run();
+	
+    _ = WaitForMultipleObjects(threads.len, &threads[0], 1, INFINITE); 
+}
+
+fn thread_entry(lpParameter: LPVOID) callconv(WINAPI) DWORD {
+	_ = lpParameter;
+	run();
+	return 0;
+}
+
+fn run() void {
+	const thread_id: u64 = GetCurrentThreadId();
+	while (true) {
+		if (b_exit) {
+			break;
+		}
+
+		const wait_idx = wait_list.find_with_thread(thread_id);
+		if (wait_idx != WAIT_LIST_SIZE) {
+			__continue(&wait_list.ctxs[wait_idx]);
+			
+			const stack: usize = wait_list.ctxs[wait_idx].stack_limit;
+			if (wait_list.remove_at_zero(wait_idx)) {
+				allocator.free(stack);
+			}
+			
+			continue;
+		}
+		
+		const info: Info = fibers.pop();
+		if (info.is_valid()) {
+			const mem = allocator.alloc();
+			const size = STACK_SIZE;
+
+			var rsp: usize = mem + size - @sizeOf(Header);
+
+			var header: Header = .{};
+			header.key = fnv1(info.name);
+			rsp -= 32;
+			header.p_user_data = rsp;
+			rsp -= @sizeOf(Context);
+			header.p_context = rsp;
+			header.thread_id = GetCurrentThreadId();
+
+			var ctx: Context = .{};
+			ctx.rip = info.func;
+			ctx.rsp = rsp;
+    		ctx.fiber_storage = 0;
+    		ctx.deallocation_stack = mem;
+    		ctx.stack_limit = mem;
+    		ctx.stack_base = mem + size;
+
+			const dst = @as([*]u8, @ptrFromInt(header.p_user_data))[0..32];
+			const src = @as([*]const u8, @ptrCast(&info.user_data))[0..32];
+			@memcpy(dst, src);
+			
+			// since we use items on the stack and don't
+			// control where they are pushed, we use this
+			// proxy for assembly only functions
+			__pop(&header, &ctx);
+
+			if (wait_list.search(header.key) == WAIT_LIST_SIZE) {
+				allocator.free(mem);
+			}
+
+			continue;
+		}
+
+		for (0..16) |_| {
+			asm volatile("pause" :::);
+		}
 	}
 }
 
@@ -398,6 +457,8 @@ fn __pop(header: *Header, ctx: *Context) void {
 			\\ movq %rax, 8*1(%[base])
 			\\ movq 8*2(%rcx), %rax
 			\\ movq %rax, 8*2(%[base])
+			\\ movq 8*3(%rcx), %rax
+			\\ movq %rax, 8*3(%[base])
 
 			// move p_context to register
 			\\ movq 8*2(%[base]), %r8
@@ -537,27 +598,44 @@ fn __pop(header: *Header, ctx: *Context) void {
 }
 
 pub fn pause(value: u32) void {
-	const idx = wait_list.get();
+	var header: Header = .{};
+	__get_header(&header);
 
+	wait_list.spinlock.lock();
+	const idx = wait_list.reserve_unsafe(header.key);
+
+	wait_list.thread_ids[idx] = header.thread_id;
 	wait_list.vals[idx] = value;
 
 	// since we use items on the stack and don't
 	// control where they are pushed, we use this
 	// proxy for assembly only functions
-	__pause(&wait_list.keys[idx], &wait_list.ctxs[idx]);
-	
-	// std.debug.print("pause(...), idx {}, key {}, val {}\n", .{
-	// 	idx, wait_list.keys[idx], wait_list.vals[idx]
-	// });
-	// TODO: verify
-	// wait_list.verify(wait_list.keys[idx]);
-	
-	// __pause1(&wait_list.ctxs[idx]);
-	// __pause1();
+	__pause0(&wait_list.ctxs[idx]);
+	wait_list.spinlock.unlock();
+	__pause1(header.p_context);
 }
 
-fn __pause(key: *u64, ctx: *Context) void {
-	_ = key;
+fn __get_header(header: *Header) void {
+	_ = header;
+	
+	asm volatile(
+        	\\ movq %gs:(0x30), %r8
+        	\\ movq 0x08(%r8), %r8
+			\\ leaq -8*4(%r8), %r8
+			
+			\\ movq 8*0(%r8), %rax
+			\\ movq %rax, 8*0(%rcx)
+			\\ movq 8*1(%r8), %rax
+			\\ movq %rax, 8*1(%rcx)
+			\\ movq 8*2(%r8), %rax
+			\\ movq %rax, 8*2(%rcx)
+			\\ movq 8*3(%r8), %rax
+			\\ movq %rax, 8*3(%rcx)
+			:::
+	);
+}
+
+fn __pause0(ctx: *Context) void {
 	_ = ctx;
 	
 	// creating new context to return to
@@ -565,79 +643,57 @@ fn __pause(key: *u64, ctx: *Context) void {
 			// saving label as return point since
 			// we want to use RETQ
         	\\ leaq CONTINUE0(%rip), %rax
-        	\\ movq %rax, 8*0(%rdx)
+        	\\ movq %rax, 8*0(%rcx)
 			
-        	\\ movq %rsp, 8*1(%rdx)
-        	\\ movq %rbx, 8*2(%rdx)
-        	\\ movq %rbp, 8*3(%rdx)
-        	\\ movq %r12, 8*4(%rdx)
-        	\\ movq %r13, 8*5(%rdx)
-        	\\ movq %r14, 8*6(%rdx)
-        	\\ movq %r15, 8*7(%rdx)
-        	\\ movq %rdi, 8*8(%rdx)
-        	\\ movq %rsi, 8*9(%rdx)
+        	\\ movq %rsp, 8*1(%rcx)
+        	\\ movq %rbx, 8*2(%rcx)
+        	\\ movq %rbp, 8*3(%rcx)
+        	\\ movq %r12, 8*4(%rcx)
+        	\\ movq %r13, 8*5(%rcx)
+        	\\ movq %r14, 8*6(%rcx)
+        	\\ movq %r15, 8*7(%rcx)
+        	\\ movq %rdi, 8*8(%rcx)
+        	\\ movq %rsi, 8*9(%rcx)
 			
-        	\\ movups %xmm6,  8*10(%rdx)
-        	\\ movups %xmm7,  8*12(%rdx)
-        	\\ movups %xmm8,  8*14(%rdx)
-        	\\ movups %xmm9,  8*16(%rdx)
-        	\\ movups %xmm10, 8*18(%rdx)
-        	\\ movups %xmm11, 8*20(%rdx)
-        	\\ movups %xmm12, 8*22(%rdx)
-        	\\ movups %xmm13, 8*24(%rdx)
-        	\\ movups %xmm14, 8*26(%rdx)
-        	\\ movups %xmm15, 8*28(%rdx)
+        	\\ movups %xmm6,  8*10(%rcx)
+        	\\ movups %xmm7,  8*12(%rcx)
+        	\\ movups %xmm8,  8*14(%rcx)
+        	\\ movups %xmm9,  8*16(%rcx)
+        	\\ movups %xmm10, 8*18(%rcx)
+        	\\ movups %xmm11, 8*20(%rcx)
+        	\\ movups %xmm12, 8*22(%rcx)
+        	\\ movups %xmm13, 8*24(%rcx)
+        	\\ movups %xmm14, 8*26(%rcx)
+        	\\ movups %xmm15, 8*28(%rcx)
 			
         	\\ movq %gs:(0x30), %r8
 			
         	\\ movq 0x20(%r8), %rax
-        	\\ movq %rax, 8*30(%rdx)
+        	\\ movq %rax, 8*30(%rcx)
         	\\ movq 0x1478(%r8), %rax
-        	\\ movq %rax, 8*31(%rdx)
+        	\\ movq %rax, 8*31(%rcx)
         	\\ movq 0x10(%r8), %rax
-        	\\ movq %rax, 8*32(%rdx)
+        	\\ movq %rax, 8*32(%rcx)
         	\\ movq 0x08(%r8), %rax
-        	\\ movq %rax, 8*33(%rdx)
-
-			// saving the key from header
-			\\ leaq -8*4(%rax), %rax
-			\\ movq 8*0(%rax), %rax
-			\\ movq %rax, (%rcx)
-			
-			// TEST
-			// TODO: integrate better
-        	\\ movq %gs:(0x30), %r10
-        	\\ movq 0x08(%r10), %rax
-        	\\ leaq -8*4(%rax), %rax
-
-			// remember that we have context + pad + key
-			\\ movq 8*2(%rax), %rax
-			\\ leaq -8*1(%rax), %rsp
-			\\ retq
-			
-			\\ CONTINUE0:
-			:
-			:
+        	\\ movq %rax, 8*33(%rcx)
+			:::
 	);
 }
 
-fn cont() void {
-	const idx = wait_list.pop();
+fn __pause1(rsp: u64) void {
+	_ = rsp;
 	
-	// since we use items on the stack and don't
-	// control where they are pushed, we use this
-	// proxy for assembly only functions
-	__cont(&wait_list.ctxs[idx]);
-	
-	assert(wait_list.keys[idx] != 0);
-	if (wait_list.vals[idx] == 0) {
-		wait_list.keys[idx] = 0;
-		wait_list.vals[idx] = 0;
-		allocator.free(wait_list.ctxs[idx].stack_limit);
-	}
+	asm volatile(
+			// return to function that called the context
+			\\ leaq -8*1(%rcx), %rsp
+			\\ retq
+			
+			\\ CONTINUE0:
+			:::
+	);
 }
 
-fn __cont(ctx: *Context) void {
+fn __continue(ctx: *Context) void {
 	_ = ctx;
 	
 	// saving current context and overriding old context
@@ -826,6 +882,19 @@ pub fn getUserData(comptime T: type) *T {
 	);
 }
 
+pub fn getThreadId() u64 {
+	return asm volatile (
+			// retrieve header
+        	\\ movq %gs:(0x30), %r10
+        	\\ movq 0x08(%r10), %rax
+        	\\ leaq -8*4(%rax), %rax
+			// return Header::thread_id
+			\\ movq 8*3(%rax), %rax
+			: [ret] "={rax}" (-> u64)
+			:
+	);
+}
+
 fn assert(x: bool) void {
     if (!x) {
         @panic("assert failed!");
@@ -843,4 +912,72 @@ comptime {
 	staticAssert(@sizeOf(Header) == 8*4);
 	staticAssert(@sizeOf(Context) == 8*34);
 }
+
+const WINAPI: std.builtin.CallingConvention = if (native_arch == .x86) .Stdcall else .C;
+// const WINAPI: std.builtin.CallingConvention = .C;
+
+// https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types
+const HANDLE = ?*anyopaque;
+const SIZE_T = u64;
+const LPVOID = ?*anyopaque;
+const WORD = u16;
+const DWORD = u32;
+const LPDWORD = ?*u32;
+const DWORD_PTR = u64;
+const BOOL = i32;
+const INFINITE: u32 = 0xffffffff;
+
+// https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/ms686736(v=vs.85)
+const LPTHREAD_START_ROUTINE = *const fn (lpParameter: LPVOID) callconv(WINAPI) DWORD;
+
+// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/ns-sysinfoapi-system_info
+const SYSTEM_INFO = extern struct {
+    anon1: extern union {
+        dwOemId: DWORD,
+        anon2: extern struct {
+            wProcessorArchitecture: WORD,
+            wReserved: WORD,
+        },
+    },
+    dwPageSize: DWORD,
+    lpMinimumApplicationAddress: LPVOID,
+    lpMaximumApplicationAddress: LPVOID,
+    dwActiveProcessorMask: DWORD_PTR,
+    dwNumberOfProcessors: DWORD,
+    dwProcessorType: DWORD,
+    dwAllocationGranularity: DWORD,
+    wProcessorLevel: WORD,
+    wProcessorRevision: WORD,
+};
+
+// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsysteminfo
+extern "kernel32" fn GetSystemInfo(lpSystemInfo: *SYSTEM_INFO) callconv(WINAPI) void;
+
+// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createthread
+extern "kernel32" fn CreateThread(
+    lpThreadAttributes: ?*anyopaque,
+    dwStackSize: SIZE_T,
+    lpStartAddress: LPTHREAD_START_ROUTINE,
+    lpParameter: LPVOID,
+    dwCreationFlags: DWORD, 
+    lpThreadId: LPDWORD
+) callconv(WINAPI) HANDLE;
+
+// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthreadid
+extern "kernel32" fn GetCurrentThreadId() callconv(WINAPI) DWORD;
+
+// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitprocess
+extern "kernel32" fn ExitProcess(uExitCode: c_uint) callconv(WINAPI) noreturn;
+
+// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects
+extern "kernel32" fn WaitForMultipleObjects(
+  nCount: DWORD,
+  lpHandles: *const HANDLE,
+  bWaitAll: BOOL,
+  dwMilliseconds: DWORD
+) callconv(WINAPI) DWORD;
+
+extern "kernel32" fn SwitchToThread() callconv(WINAPI) BOOL;
+
+extern "kernel32" fn Sleep(dwMilliseconds: DWORD) callconv(WINAPI) void;
 
