@@ -1,3 +1,4 @@
+//   
 //      FIBER'S STACK
 //   
 //   |-----------------| <- low addr
@@ -14,8 +15,9 @@
 //   | -  user data  - |
 //   | - - header  - - |
 //   |-----------------| <- high addr
-//   
-
+// 
+// 
+// USEFUL LINKS:
 // https://www.youtube.com/watch?v=HIVBhKj7gQU
 // https://swedishcoding.com/wp-content/uploads/2015/03/parallelizing_the_naughty_dog_engine_using_fibers.pdf
 // https://graphitemaster.github.io/fibers/
@@ -50,17 +52,194 @@
 // https://preshing.com/20120625/memory-ordering-at-compile-time/
 // https://en.wikipedia.org/wiki/Memory_ordering
 // https://peeterjoot.wordpress.com/2009/12/04/intel-memory-ordering-fence-instructions-and-atomic-operations/
-
-// TODO:
-// - compile time checks for platforms and cpus
-// - checks for stack and memory alignment
-// - measure cycles
-// - comment everything
+// 
+// 
+// SECTIONS:
+//   [GLOBAL VARIABLES]
+//   [PUBLIC TYPES]
+//   [PUBLIC API]
+//   [INTERNAL TYPES]
+//   [INTERNAL FUNCTIONS]
+//   [STATIC ASSERTIONS]
+//   [IMPORTS]
+//   [TESTS]
+// 
+// 
 
 const std = @import("std");
 const builtin = @import("builtin");
-const native_arch = builtin.cpu.arch;
 
+// 
+// 
+// [SECTION] GLOBAL VARIABLES
+// 
+// 
+
+const STACK_SIZE: usize = 16*1024;
+const WAIT_LIST_SIZE: usize = 16;
+const MAX_CORES: usize = 2;
+
+var b_exit: bool = false;
+
+var allocator: Allocator = .{};
+var fibers: RingBuffer(Info, 128) = .{};
+var wait_list: WaitList = .{};
+
+// 
+// 
+// [SECTION] PUBLIC TYPES
+// 
+// 
+
+// user data is alloved to be 0
+pub const Info = struct {
+	const Self = @This();
+	
+	name: []const u8,
+	func: u64,
+	user_data: u256,
+
+	fn is_valid(self: *const Self) bool {
+		if (self.func == 0) {
+			return false;
+		}
+		return true;
+	}
+};
+
+// 
+// 
+// [SECTION] PUBLIC API
+// 
+// 
+
+pub fn sizeof() usize {
+	return 64*STACK_SIZE;
+}
+
+pub fn init(mem: usize) void {
+	allocator.status = 0;
+	allocator.mem = mem;
+	
+	allocator.init();
+	fibers.init();
+	wait_list.init();
+}
+
+pub fn exit() void {
+	b_exit = true;
+}
+
+pub fn dec(name: []const u8) bool {
+	const key = fnv1(name);
+
+	wait_list.spinlock.lock();
+	defer wait_list.spinlock.unlock();
+
+	for (wait_list.keys, 0..) |k, i| {
+		if (key == k) {
+			if (wait_list.vals[i] > 0) {
+				wait_list.vals[i] -= 1;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+pub fn push(info: Info) void {
+	fibers.push(info);
+}
+
+pub fn start() void {
+	// subtract from core count since main thread is already active
+	var threads: [MAX_CORES - 1]HANDLE = undefined;
+	
+	var system_info: SYSTEM_INFO = undefined;
+	GetSystemInfo(&system_info);
+	var num_cores: u32 = system_info.dwNumberOfProcessors;
+	num_cores = @min(MAX_CORES - 1, num_cores);
+	
+	for (0..num_cores) |i| {
+        threads[i] = CreateThread(null, 0, &thread_entry, null, 0, null);
+	}
+	
+	run();
+	
+	// TODO: check for errors
+    _ = WaitForMultipleObjects(threads.len, &threads[0], 1, INFINITE); 
+}
+
+pub fn pause(value: u32) void {
+	var header: Header = .{};
+	__get_header(&header);
+
+	// since __pause0 writes to wait_list, make sure there are no conflicts
+	wait_list.spinlock.lock();
+	const idx = wait_list.reserve_unsafe(header.key);
+
+	wait_list.thread_ids[idx] = header.thread_id;
+	wait_list.vals[idx] = value;
+
+	__pause0(&wait_list.ctxs[idx]);
+	wait_list.spinlock.unlock();
+	
+	__pause1(header.p_context);
+}
+
+// custom user data is transformed into 32 byte integer
+pub fn pack(user_data: anytype) u256 {
+	staticAssert(@sizeOf(@TypeOf(user_data)) <= 32);
+	
+	var payload: u256 = 0;
+	
+	var dst: []u8 = undefined;
+	dst.ptr = @ptrCast(&payload);
+	dst.len = @sizeOf(@TypeOf(user_data));
+	
+	var src: []u8 = undefined;
+	src.ptr = @constCast(@ptrCast(&user_data));
+	src.len = @sizeOf(@TypeOf(user_data));
+	
+	@memcpy(dst, src);
+	
+	return payload;
+}
+
+pub fn getUserData(comptime T: type) *T {
+	return asm volatile (
+			// retrieve header
+        	\\ movq %gs:(0x30), %r10
+        	\\ movq 0x08(%r10), %rax
+        	\\ leaq -8*4(%rax), %rax
+			// return Header::p_user_data
+			\\ movq 8*1(%rax), %rax
+			: [ret] "={rax}" (-> *T)
+			:
+	);
+}
+
+pub fn getThreadId() u64 {
+	return asm volatile (
+			// retrieve header
+        	\\ movq %gs:(0x30), %r10
+        	\\ movq 0x08(%r10), %rax
+        	\\ leaq -8*4(%rax), %rax
+			// return Header::thread_id
+			\\ movq 8*3(%rax), %rax
+			: [ret] "={rax}" (-> u64)
+			:
+	);
+}
+
+// 
+// 
+// [SECTION] INTERNAL TYPES
+// 
+// 
+
+// probably not the safest since it does not have any explicit memory or 
+// compiler barriers
 const Spinlock = struct {
     const Self = @This();
     
@@ -241,21 +420,6 @@ const WaitList = struct {
 	}
 };
 
-pub const Info = struct {
-	const Self = @This();
-	
-	name: []const u8,
-	func: u64,
-	user_data: u256,
-
-	fn is_valid(self: *const Self) bool {
-		if (self.func == 0) {
-			return false;
-		}
-		return true;
-	}
-};
-
 const Context = packed struct {
     rip: u64 = 0,
     rsp: u64 = 0,
@@ -280,7 +444,7 @@ const Context = packed struct {
     xmm14: i128 = 0,
     xmm15: i128 = 0,
 
-    // NT_TIB stuff
+    // NT_TIB data that needs to be changed
     fiber_storage: u64 = 0,
     deallocation_stack: u64 = 0,
     stack_limit: u64 = 0,
@@ -294,15 +458,11 @@ const Header = packed struct {
 	thread_id: u64 = 0,
 };
 
-const STACK_SIZE: usize = 16*1024;
-const WAIT_LIST_SIZE: usize = 16;
-const MAX_CORES: usize = 2;
-
-var b_exit: bool = false;
-
-var allocator: Allocator = .{};
-var fibers: RingBuffer(Info, 128) = .{};
-var wait_list: WaitList = .{};
+// 
+// 
+// [SECTION] INTERNAL FUNCTIONS
+// 
+// 
 
 fn fnv1(str: []const u8) u64 {
 	// https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
@@ -319,61 +479,6 @@ fn fnv1(str: []const u8) u64 {
 		hash = 1;
 	}
 	return hash;
-}
-
-pub fn sizeof() usize {
-	return 64*STACK_SIZE;
-}
-
-pub fn init(mem: usize) void {
-	allocator.status = 0;
-	allocator.mem = mem;
-	
-	allocator.init();
-	fibers.init();
-	wait_list.init();
-}
-
-pub fn exit() void {
-	b_exit = true;
-}
-
-pub fn dec(name: []const u8) bool {
-	const key = fnv1(name);
-
-	wait_list.spinlock.lock();
-	defer wait_list.spinlock.unlock();
-
-	for (wait_list.keys, 0..) |k, i| {
-		if (key == k) {
-			if (wait_list.vals[i] > 0) {
-				wait_list.vals[i] -= 1;
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
-pub fn push(info: Info) void {
-	fibers.push(info);
-}
-
-pub fn start() void {
-	var threads: [MAX_CORES - 1]HANDLE = undefined;
-	
-	var system_info: SYSTEM_INFO = undefined;
-	GetSystemInfo(&system_info);
-	var num_cores: u32 = system_info.dwNumberOfProcessors;
-	num_cores = @min(MAX_CORES - 1, num_cores);
-	
-	for (0..num_cores) |i| {
-        threads[i] = CreateThread(null, 0, &thread_entry, null, 0, null);
-	}
-	
-	run();
-	
-    _ = WaitForMultipleObjects(threads.len, &threads[0], 1, INFINITE); 
 }
 
 fn thread_entry(lpParameter: LPVOID) callconv(WINAPI) DWORD {
@@ -406,6 +511,8 @@ fn run() void {
 			const mem = allocator.alloc();
 			const size = STACK_SIZE;
 
+			assert(mem % 16 == 0);
+			
 			var rsp: usize = mem + size - @sizeOf(Header);
 
 			var header: Header = .{};
@@ -415,6 +522,8 @@ fn run() void {
 			rsp -= @sizeOf(Context);
 			header.p_context = rsp;
 			header.thread_id = GetCurrentThreadId();
+
+			assert(rsp % 16 == 0);
 
 			var ctx: Context = .{};
 			ctx.rip = info.func;
@@ -541,10 +650,10 @@ fn __pop(header: *Header, ctx: *Context) void {
         	\\ movq %rax, 0x08(%r9)
 			
         	\\ callq *%r8
-			:
-			:
+			:::
 	);
 
+	// restoring context on return
 	asm volatile (
 			// retrieve header
         	\\ movq %gs:(0x30), %r10
@@ -590,34 +699,16 @@ fn __pop(header: *Header, ctx: *Context) void {
         	\\ movq  %rax, 0x10(%r10)
         	\\ movq  8*33(%rcx), %rax
         	\\ movq  %rax, 0x08(%r10)
-			:
-			:
+			:::
 	);
 	
 	_ = header;
 }
 
-pub fn pause(value: u32) void {
-	var header: Header = .{};
-	__get_header(&header);
-
-	wait_list.spinlock.lock();
-	const idx = wait_list.reserve_unsafe(header.key);
-
-	wait_list.thread_ids[idx] = header.thread_id;
-	wait_list.vals[idx] = value;
-
-	// since we use items on the stack and don't
-	// control where they are pushed, we use this
-	// proxy for assembly only functions
-	__pause0(&wait_list.ctxs[idx]);
-	wait_list.spinlock.unlock();
-	__pause1(header.p_context);
-}
-
 fn __get_header(header: *Header) void {
 	_ = header;
 	
+	// retrieves header from the stack
 	asm volatile(
         	\\ movq %gs:(0x30), %r8
         	\\ movq 0x08(%r8), %r8
@@ -641,7 +732,8 @@ fn __pause0(ctx: *Context) void {
 	// creating new context to return to
 	asm volatile (
 			// saving label as return point since
-			// we want to use RETQ
+			// we want to use RETQ and return here
+			// from __continue
         	\\ leaq CONTINUE0(%rip), %rax
         	\\ movq %rax, 8*0(%rcx)
 			
@@ -683,6 +775,8 @@ fn __pause0(ctx: *Context) void {
 fn __pause1(rsp: u64) void {
 	_ = rsp;
 	
+	// moving rsp to bottom so that we can return to previous caller
+	// which is either pause or continue
 	asm volatile(
 			// return to function that called the context
 			\\ leaq -8*1(%rcx), %rsp
@@ -699,10 +793,6 @@ fn __continue(ctx: *Context) void {
 	// saving current context and overriding old context
 	asm volatile (
 			// load p_context from header
-        	// \\ movq %gs:(0x30), %r10
-        	// \\ movq 0x08(%r10), %rax
-        	// \\ leaq -8*4(%rax), %rdx
-			// \\ movq 8*2(%rdx), %rdx
 			\\ movq 8*33(%rcx), %rax
         	\\ leaq -8*4(%rax), %rdx
 			\\ movq 8*2(%rdx), %rdx
@@ -750,9 +840,7 @@ fn __continue(ctx: *Context) void {
 			\\ leaq -8*1(%rdx), %rax
         	\\ leaq CONTINUE1(%rip), %r8
 			\\ movq %r8, (%rax)
-			:
-			:
-			// :[stack] "{rcx}" (ctx.*.stack_base - @sizeOf(Context))
+			:::
 	);
 
 	// restoring context from the wait list
@@ -796,9 +884,7 @@ fn __continue(ctx: *Context) void {
 			// the current %RSP and we have replaced return 
 			// address in previous asm block
         	\\ jmpq *%rdx
-			:
-			:
-			// :[ctx] "{rcx}" (ctx)
+			:::
 	);
 
 	// restoring this context
@@ -851,50 +937,6 @@ fn __continue(ctx: *Context) void {
 	);
 }
 
-pub fn pack(user_data: anytype) u256 {
-	staticAssert(@sizeOf(@TypeOf(user_data)) <= 32);
-	
-	var payload: u256 = 0;
-	
-	var dst: []u8 = undefined;
-	dst.ptr = @ptrCast(&payload);
-	dst.len = @sizeOf(@TypeOf(user_data));
-	
-	var src: []u8 = undefined;
-	src.ptr = @constCast(@ptrCast(&user_data));
-	src.len = @sizeOf(@TypeOf(user_data));
-	
-	@memcpy(dst, src);
-	
-	return payload;
-}
-
-pub fn getUserData(comptime T: type) *T {
-	return asm volatile (
-			// retrieve header
-        	\\ movq %gs:(0x30), %r10
-        	\\ movq 0x08(%r10), %rax
-        	\\ leaq -8*4(%rax), %rax
-			// return Header::p_user_data
-			\\ movq 8*1(%rax), %rax
-			: [ret] "={rax}" (-> *T)
-			:
-	);
-}
-
-pub fn getThreadId() u64 {
-	return asm volatile (
-			// retrieve header
-        	\\ movq %gs:(0x30), %r10
-        	\\ movq 0x08(%r10), %rax
-        	\\ leaq -8*4(%rax), %rax
-			// return Header::thread_id
-			\\ movq 8*3(%rax), %rax
-			: [ret] "={rax}" (-> u64)
-			:
-	);
-}
-
 fn assert(x: bool) void {
     if (!x) {
         @panic("assert failed!");
@@ -907,14 +949,28 @@ fn staticAssert(comptime x: bool) void {
     }
 }
 
+// 
+// 
+// [SECTION] STATIC ASSERTIONS
+// 
+// Compile time checks.
+
 comptime {
-	// TODO: test other offsets, cpu arch and os
+	// these are here to make sure that these types don't change since a lot of 
+	// assembly depends on them.
 	staticAssert(@sizeOf(Header) == 8*4);
 	staticAssert(@sizeOf(Context) == 8*34);
 }
 
+// 
+// 
+// [SECTION] IMPORTS
+// 
+// Win32 imported types and functions.
+
+const native_arch = builtin.cpu.arch;
+
 const WINAPI: std.builtin.CallingConvention = if (native_arch == .x86) .Stdcall else .C;
-// const WINAPI: std.builtin.CallingConvention = .C;
 
 // https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types
 const HANDLE = ?*anyopaque;
@@ -981,3 +1037,106 @@ extern "kernel32" fn SwitchToThread() callconv(WINAPI) BOOL;
 
 extern "kernel32" fn Sleep(dwMilliseconds: DWORD) callconv(WINAPI) void;
 
+// 
+// 
+// [SECTION] TESTS
+// 
+// 
+
+const TEST_SIZE: usize = 100000000;
+const TEST_LEN: usize = 4;
+
+const TestInfo = struct {
+	spinlock: Spinlock = .{},
+	counter: u32 = 0,
+    results: []u32 = undefined,
+    threads: [4]u32 = [_]u32{ 0 } ** 4,
+    visits: [4]u32 = [_]u32{ 0 } ** 4,
+};
+
+pub fn run_tests() !void {
+    const len: usize = TEST_SIZE * @sizeOf(u32);
+    
+    const MEM_COMMIT: u32 = 0x00001000;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    const ptr: *anyopaque = std.os.windows.VirtualAlloc(null, len, MEM_COMMIT, PAGE_EXECUTE_READWRITE) catch unreachable;
+
+    var results: []u32 = undefined;
+    results.ptr = @ptrCast(@alignCast(ptr));
+    results.len = TEST_SIZE;
+
+    var info: TestInfo = .{ .results = results };
+	info.spinlock.init();
+    
+    var threads = [_]HANDLE{ null } ** 4;
+    threads[0] = CreateThread(null, 0, &thread_entry_test, @ptrCast(&info), 0, null);
+    threads[1] = CreateThread(null, 0, &thread_entry_test, @ptrCast(&info), 0, null);
+    threads[2] = CreateThread(null, 0, &thread_entry_test, @ptrCast(&info), 0, null);
+    threads[3] = CreateThread(null, 0, &thread_entry_test, @ptrCast(&info), 0, null);
+    
+    _ = WaitForMultipleObjects(threads.len, &threads[0], 1, INFINITE); 
+    
+    var errors: u32 = 0;
+    for (0..TEST_SIZE) |j| {
+        if (info.results[j] != j) {
+            errors += 1;
+        }
+        info.results[j] = 0;
+    }
+
+
+	std.testing.expectEqual(errors, 0) catch {
+    	std.debug.print("[test] total size {}, errors {}\n", .{TEST_SIZE, errors});
+    	for (info.threads, info.visits) |t, v| {
+    	    std.debug.print("    [thread {}] visits {}\n", .{t, v});
+    	}
+		return error.DataRaceError;
+	};
+}
+fn thread_entry_test(lpParameter: LPVOID) callconv(WINAPI) DWORD {
+    if (lpParameter == null) {
+        return 1;
+    }
+    
+    const info: *TestInfo = @alignCast(@ptrCast(lpParameter));
+    
+    outer: while (true) {
+        info.*.spinlock.lock();
+        defer info.*.spinlock.unlock();
+        
+        if (info.*.counter < TEST_SIZE) {
+            const idx: u32 = info.*.counter;
+            info.*.results[idx] = info.*.counter;
+            
+            const thread_id: u32 = GetCurrentThreadId();
+            
+            info.*.counter += 1;
+
+            for (info.*.threads, 0..) |t, i| {
+                if (t == thread_id) {
+                    info.*.visits[i] += 1;
+                    continue :outer;
+                }
+            }
+            
+            for (info.*.threads, 0..) |t, i| {
+                if (t == 0) {
+                    info.*.threads[i] = thread_id;
+                    info.*.visits[i] += 1;
+                    break;
+                }
+            }
+        }
+        else {
+            break;
+        }
+    }
+    
+    return 0;
+}
+
+test "spinlock" {
+	for (0..TEST_LEN) |_| {
+		try run_tests();
+	}
+}

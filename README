@@ -1,0 +1,23 @@
+fibers.zig
+
+Personal project inspired by 'Fibers, Oh My!' and 'Parallelizing the Naughty Dog
+engine using fibers'. Allows for context switching and multithreading with 
+custom synchronization primitives. Developed on x64 Windows 11, and should not 
+work on any other platform or architecture since context switching involves 
+assembly and OS structures and sychronization involvolves compiler/memory barriers. 
+And error handling is non-existant.
+
+Current status: WORKING. Should you use it: NO, since I only tested on one simple 
+case. 
+
+Wait list keeps track of thread ids and each context is allowed to run on one 
+specific thread. Underscore functions are assembly only functions. They are
+separated from main body because we don't want to handle function 
+prologue/epilogue when copying contexts aroun when copying contexts around.
+
+You are free to use this project how ever you want. Just note that this project 
+is archieved and it will not be updated.
+
+Last compiled with Zig v0.12.0-dev.3533+e5d900268. No external dependencies beyond 
+what zig compiler links on default.
+

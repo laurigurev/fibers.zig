@@ -1,5 +1,5 @@
 const std = @import("std");
-const fib = @import("fibers.zig");
+const fib = @import("fibers");
 
 fn foo() void {
     const thread = fib.getThreadId();
